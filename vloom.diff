@@ -1,0 +1,1417 @@
+diff --git a/eval/vcfi-test/llvm_cfi.mk b/eval/vcfi-test/llvm_cfi.mk
+index 1dd264974..9d8d6b4a3 100644
+--- a/eval/vcfi-test/llvm_cfi.mk
++++ b/eval/vcfi-test/llvm_cfi.mk
+@@ -6,7 +6,7 @@ CXXFLAGS	+= -std=c++11
+ ifeq ($(DEBUG), 1)
+ 	CXXFLAGS += -O0 -g -DDEBUG
+ else
+-	CXXFLAGS += -O2 -DNDEBUG
++	CXXFLAGS += -O2 -g -DNDEBUG
+ endif
+ 
+ #
+@@ -20,6 +20,9 @@ else ifeq ($(VCFI), 2)
+ else ifeq ($(VCFI), 3)
+ 	CXXFLAGS += -flto -fvisibility=default -fsanitize-cfi-cross-dso -fsanitize=cfi-vcall
+ 
++else ifeq ($(VCFI), 4)
++	CXXFLAGS += -flto -fvisibility=hidden -fsanitize-cfi-cross-dso -fsanitize=cfi-vcall
++	
+ else
+ 	CXXFLAGS += -flto -fvisibility=hidden -fsanitize=cfi-vcall
+ endif
+diff --git a/llvm-7.1.0.src/include/llvm/CodeGen/AsmPrinter.h b/llvm-7.1.0.src/include/llvm/CodeGen/AsmPrinter.h
+index cb97eed8d..b60563809 100644
+--- a/llvm-7.1.0.src/include/llvm/CodeGen/AsmPrinter.h
++++ b/llvm-7.1.0.src/include/llvm/CodeGen/AsmPrinter.h
+@@ -124,10 +124,6 @@ public:
+   /// Enable print [latency:throughput] in output.
+   bool EnablePrintSchedInfo = false;
+ 
+-protected:
+-  // set to Non-null if MBB.getName() started with __VLOOM_NEXT_XXX
+-  size_t nNextSeq;
+-
+ private:
+   MCSymbol *CurrentFnBegin = nullptr;
+   MCSymbol *CurrentFnEnd = nullptr;
+diff --git a/llvm-7.1.0.src/include/llvm/CodeGen/MachineInstr.h b/llvm-7.1.0.src/include/llvm/CodeGen/MachineInstr.h
+index 7b968d785..88e13cdf4 100644
+--- a/llvm-7.1.0.src/include/llvm/CodeGen/MachineInstr.h
++++ b/llvm-7.1.0.src/include/llvm/CodeGen/MachineInstr.h
+@@ -1315,10 +1315,7 @@ public:
+   /// Replace current source information with new such.
+   /// Avoid using this, the constructor argument is preferable.
+   void setDebugLoc(DebugLoc dl) {
+-    MDNode *cfi = debugLoc.CFILabel;
+     debugLoc = std::move(dl);
+-    if (!debugLoc.CFILabel)
+-      debugLoc.CFILabel = cfi;
+     assert(debugLoc.hasTrivialDestructor() && "Expected trivial destructor");
+   }
+ 
+diff --git a/llvm-7.1.0.src/include/llvm/IR/DebugLoc.h b/llvm-7.1.0.src/include/llvm/IR/DebugLoc.h
+index 30a64915c..9f619ffc5 100644
+--- a/llvm-7.1.0.src/include/llvm/IR/DebugLoc.h
++++ b/llvm-7.1.0.src/include/llvm/IR/DebugLoc.h
+@@ -34,9 +34,6 @@ namespace llvm {
+   class DebugLoc {
+     TrackingMDNodeRef Loc;
+ 
+-  public:
+-    MDNode *CFILabel = nullptr;
+-
+   public:
+     DebugLoc() = default;
+ 
+diff --git a/llvm-7.1.0.src/include/llvm/IR/DerivedTypes.h b/llvm-7.1.0.src/include/llvm/IR/DerivedTypes.h
+index a8fd89a6b..9526d6287 100644
+--- a/llvm-7.1.0.src/include/llvm/IR/DerivedTypes.h
++++ b/llvm-7.1.0.src/include/llvm/IR/DerivedTypes.h
+@@ -199,8 +199,7 @@ public:
+ /// generator for a target expects).
+ ///
+ class StructType : public CompositeType {
+-  StructType(LLVMContext &C)
+-      : CompositeType(C, StructTyID), pMangledName(nullptr) {}
++  StructType(LLVMContext &C) : CompositeType(C, StructTyID) {}
+ 
+   enum {
+     /// This is the contents of the SubClassData field.
+@@ -216,13 +215,6 @@ class StructType : public CompositeType {
+   /// type that has an empty name.
+   void *SymbolTableEntry = nullptr;
+ 
+-public:
+-  char *pMangledName;
+-  ~StructType() {
+-    if (pMangledName)
+-      free(pMangledName);
+-  }
+-
+ public:
+   StructType(const StructType &) = delete;
+   StructType &operator=(const StructType &) = delete;
+diff --git a/llvm-7.1.0.src/include/llvm/IR/Function.h b/llvm-7.1.0.src/include/llvm/IR/Function.h
+index f1c82a649..02e3ecc8e 100644
+--- a/llvm-7.1.0.src/include/llvm/IR/Function.h
++++ b/llvm-7.1.0.src/include/llvm/IR/Function.h
+@@ -102,10 +102,6 @@ private:
+   /// needs it.  The hasLazyArguments predicate returns true if the arg list
+   /// hasn't been set up yet.
+ public:
+-  bool bCXXMethod, bInstance; // method of a class/struct, and is non-static ?
+-  bool bVirtual;              // a virtual method of a class ?
+-  std::string strClassName;   // The mangled class name
+-  std::string strFuncName;    // The mangled class name
+   bool hasLazyArguments() const {
+     return getSubclassDataFromValue() & (1<<0);
+   }
+diff --git a/llvm-7.1.0.src/include/llvm/IR/Instruction.h b/llvm-7.1.0.src/include/llvm/IR/Instruction.h
+index 25e834b98..643c2a076 100644
+--- a/llvm-7.1.0.src/include/llvm/IR/Instruction.h
++++ b/llvm-7.1.0.src/include/llvm/IR/Instruction.h
+@@ -44,8 +44,6 @@ template <> struct ilist_alloc_traits<Instruction> {
+ class Instruction : public User,
+                     public ilist_node_with_parent<Instruction, BasicBlock> {
+   BasicBlock *Parent;
+-
+-public:
+   DebugLoc DbgLoc;                         // 'dbg' Metadata cache.
+ 
+   enum {
+diff --git a/llvm-7.1.0.src/lib/Bitcode/Reader/MetadataLoader.cpp b/llvm-7.1.0.src/lib/Bitcode/Reader/MetadataLoader.cpp
+index 07ec6b7a7..011c41e2c 100644
+--- a/llvm-7.1.0.src/lib/Bitcode/Reader/MetadataLoader.cpp
++++ b/llvm-7.1.0.src/lib/Bitcode/Reader/MetadataLoader.cpp
+@@ -1898,10 +1898,6 @@ Error MetadataLoader::MetadataLoaderImpl::parseMetadataAttachment(
+         }
+         Inst->setMetadata(I->second, MD);
+       }
+-      MDNode *cfinode = Inst->getMetadata("typed-CFI");
+-      if (cfinode)
+-        Inst->DbgLoc.CFILabel = cfinode;
+-
+       break;
+     }
+     }
+diff --git a/llvm-7.1.0.src/lib/CodeGen/AsmPrinter/AsmPrinter.cpp b/llvm-7.1.0.src/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+index 87a415a1c..4f031a818 100644
+--- a/llvm-7.1.0.src/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
++++ b/llvm-7.1.0.src/lib/CodeGen/AsmPrinter/AsmPrinter.cpp
+@@ -184,13 +184,6 @@ AsmPrinter::AsmPrinter(TargetMachine &tm, std::unique_ptr<MCStreamer> Streamer)
+     : MachineFunctionPass(ID), TM(tm), MAI(tm.getMCAsmInfo()),
+       OutContext(Streamer->getContext()), OutStreamer(std::move(Streamer)) {
+   VerboseAsm = OutStreamer->isVerboseAsm();
+-
+-  const char *vstr = getenv("VLOOM_DEBUGLABEL");
+-  if ((vstr != NULL) && (strncmp(vstr, "1", 2) == 0))
+-    srandom(0x40000);
+-  else
+-    srandom((uint)time(NULL));
+-  nNextSeq = random() & 0x0FFFFFFF;
+ }
+ 
+ AsmPrinter::~AsmPrinter() {
+@@ -1065,7 +1058,6 @@ void AsmPrinter::EmitFunctionBody() {
+   for (auto &MBB : *MF) {
+     // Print a label for the basic block.
+     EmitBasicBlockStart(MBB);
+-
+     for (auto &MI : MBB) {
+       // Print the assembly for the instruction.
+       if (!MI.isPosition() && !MI.isImplicitDef() && !MI.isKill() &&
+diff --git a/llvm-7.1.0.src/lib/IR/Function.cpp b/llvm-7.1.0.src/lib/IR/Function.cpp
+index ce60b86d4..72090f5ba 100644
+--- a/llvm-7.1.0.src/lib/IR/Function.cpp
++++ b/llvm-7.1.0.src/lib/IR/Function.cpp
+@@ -219,7 +219,7 @@ Function::Function(FunctionType *Ty, LinkageTypes Linkage, const Twine &name,
+                    Module *ParentModule)
+     : GlobalObject(Ty, Value::FunctionVal,
+                    OperandTraits<Function>::op_begin(this), 0, Linkage, name),
+-      NumArgs(Ty->getNumParams()), bCXXMethod(false) {
++      NumArgs(Ty->getNumParams()) {
+   assert(FunctionType::isValidReturnType(getReturnType()) &&
+          "invalid return type");
+   setGlobalObjectSubClassData(0);
+diff --git a/llvm-7.1.0.src/lib/MC/MCParser/AsmParser.cpp b/llvm-7.1.0.src/lib/MC/MCParser/AsmParser.cpp
+index ae42a959e..d811b42bc 100644
+--- a/llvm-7.1.0.src/lib/MC/MCParser/AsmParser.cpp
++++ b/llvm-7.1.0.src/lib/MC/MCParser/AsmParser.cpp
+@@ -180,6 +180,8 @@ private:
+   /// Did we already inform the user about inconsistent MD5 usage?
+   bool ReportedInconsistentMD5 = false;
+ 
++  uint32_t nNextSeq;
++
+ public:
+   AsmParser(SourceMgr &SM, MCContext &Ctx, MCStreamer &Out,
+             const MCAsmInfo &MAI, unsigned CB);
+@@ -711,6 +713,7 @@ AsmParser::AsmParser(SourceMgr &SM, MCContext &Ctx, MCStreamer &Out,
+   initializeDirectiveKindMap();
+ 
+   NumOfMacroInstantiations = 0;
++  nNextSeq = random();
+ }
+ 
+ AsmParser::~AsmParser() {
+@@ -1776,6 +1779,7 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
+     // FIXME: Diagnostics. Note the location of the definition as a label.
+     // FIXME: This doesn't diagnose assignment to a symbol which has been
+     // implicitly marked as external.
++    std::string strVloomNextLabel;
+     MCSymbol *Sym;
+     if (LocalLabelVal == -1) {
+       if (ParsingInlineAsm && SI) {
+@@ -1787,10 +1791,14 @@ bool AsmParser::parseStatement(ParseStatementInfo &Info,
+                                        RewrittenLabel);
+         IDVal = RewrittenLabel;
+       }
++      // RewrittenLabel.startswith("__VLOOM_"))
++      if (IDVal.startswith("__VLOOM_")) {
++        strVloomNextLabel = IDVal;
++        // strVloomNextLabel += "_PH_";
++        strVloomNextLabel += std::to_string(nNextSeq++);
++        IDVal = strVloomNextLabel;
++      }
+       Sym = getContext().getOrCreateSymbol(IDVal);
+-      //"_VLOOM_VCALL" || "__VLOOM_NEXT" || "__VLOOM_RET"
+-      if (IDVal.startswith("__VLOOM_"))
+-        Sym->setRedefinable(true);
+     } else
+       Sym = Ctx.createDirectionalLocalSymbol(LocalLabelVal);
+     // End of Labels should be treated as end of line for lexing
+@@ -5886,6 +5894,9 @@ bool parseAssignmentExpression(StringRef Name, bool allow_redef,
+   } else
+     Sym = Parser.getContext().getOrCreateSymbol(Name);
+ 
++  if (Name.startswith("__VLOOM_"))
++    allow_redef = true;
++
+   Sym->setRedefinable(allow_redef);
+ 
+   return false;
+diff --git a/llvm-7.1.0.src/lib/Target/X86/X86MCInstLower.cpp b/llvm-7.1.0.src/lib/Target/X86/X86MCInstLower.cpp
+index 1459b037c..d38c7b497 100644
+--- a/llvm-7.1.0.src/lib/Target/X86/X86MCInstLower.cpp
++++ b/llvm-7.1.0.src/lib/Target/X86/X86MCInstLower.cpp
+@@ -1617,12 +1617,6 @@ void X86AsmPrinter::EmitSEHInstruction(const MachineInstr *MI) {
+   }
+ }
+ 
+-  char szSuffix[64];
+-  char *to_hex(uint seq) {
+-    sprintf(szSuffix, "%x", seq);
+-    return szSuffix;
+-  }
+-
+ void X86AsmPrinter::EmitInstruction(const MachineInstr *MI) {
+   X86MCInstLower MCInstLowering(*MF, *this);
+   const X86RegisterInfo *RI =
+@@ -2259,19 +2253,6 @@ void X86AsmPrinter::EmitInstruction(const MachineInstr *MI) {
+     SMShadowTracker.emitShadowPadding(*OutStreamer, getSubtargetInfo());
+     // Then emit the call
+     OutStreamer->EmitInstruction(TmpInst, getSubtargetInfo());
+-
+-    MDNode *label = MI->getDebugLoc().CFILabel;
+-    if (label) {
+-      StringRef cfistr = cast<MDString>(label->getOperand(0))->getString();
+-      std::string strLbl = cfistr;
+-      strLbl += "_PH_";
+-      strLbl += std::to_string(nNextSeq++);
+-      MCSymbol *sym = OutContext.getOrCreateSymbol(strLbl);
+-      OutStreamer->EmitSymbolAttribute(sym, MCSymbolAttr::MCSA_Hidden);
+-      OutStreamer->EmitSymbolAttribute(sym, MCSymbolAttr::MCSA_Weak);
+-      OutStreamer->EmitLabel(sym);
+-    }
+-
+     return;
+   }
+ 
+diff --git a/llvm-7.1.0.src/lib/Transforms/Instrumentation/Vloom.cpp b/llvm-7.1.0.src/lib/Transforms/Instrumentation/Vloom.cpp
+index a7489929a..8e48fda5c 100644
+--- a/llvm-7.1.0.src/lib/Transforms/Instrumentation/Vloom.cpp
++++ b/llvm-7.1.0.src/lib/Transforms/Instrumentation/Vloom.cpp
+@@ -2,7 +2,6 @@
+ #include <stdarg.h>
+ #include <stdio.h>
+ #include <vector>
+-
+ #include "llvm/Analysis/MemoryBuiltins.h"
+ #include "llvm/Analysis/TargetLibraryInfo.h"
+ #include "llvm/Demangle/Demangle.h"
+@@ -35,8 +34,10 @@
+ using namespace llvm;
+ using namespace std;
+ 
+-static void encode_special_characters(std::string &str) {
+-  struct Encode {
++static void encode_special_characters(std::string &str)
++{
++  struct Encode
++  {
+     const char *code;
+     uint len;
+     char s;
+@@ -46,9 +47,11 @@ static void encode_special_characters(std::string &str) {
+   Encode E[] = {{"DollaR", 6, '$'}, {"TidE", 4, '~'}, {nullptr, '\0', 0}};
+ 
+   std::string::size_type pos;
+-  for (Encode *e = &E[0]; e->code; e++) {
++  for (Encode *e = &E[0]; e->code; e++)
++  {
+     pos = 0u;
+-    while ((pos = str.find(e->s, pos)) != std::string::npos) {
++    while ((pos = str.find(e->s, pos)) != std::string::npos)
++    {
+       str.replace(pos, 1, e->code);
+       pos += e->len;
+     }
+@@ -56,7 +59,8 @@ static void encode_special_characters(std::string &str) {
+ }
+ 
+ // COMPATIBLE_MODE=1, POISON_MODE=2, FLAG_MODE=3, INVALID=etc
+-enum VLOOM_MODE {
++enum VLOOM_MODE
++{
+   VLOOM_COMP = 1,
+   VLOOM_POIS = 2,
+   VLOOM_FLAG = 3,
+@@ -64,67 +68,13 @@ enum VLOOM_MODE {
+   VLOOM_IVLD,
+ };
+ 
+-struct MethodInfo {
+-  char *pClassName;
+-  char *pFuncName;
+-  unsigned nArgs;
+-  bool bVirtual;
+-  bool bFreeMe;
+-};
+-
+-class VloomPass;
+-class LabelCallBase {
+-  friend VloomPass;
+-
+-public:
+-  virtual ~LabelCallBase() {}
+-
+-  virtual Instruction *getInstruction() { return nullptr; }
+-  virtual Value *getVPtr(int idx) { return nullptr; };
+-  virtual Function *getCallee() { return nullptr; }
+-
+-  bool labelNormalCall(MethodInfo &info);
+-  bool labelDirectCall(MethodInfo &info);
+-  bool labelVirtualCall(MethodInfo &info);
+-  virtual bool labelIndirectCall(MethodInfo &info) { return false; }
+-
+-protected:
+-  bool labelDSOSymbol(Function *ee);
+-  bool _emitCallLabel(Instruction *I, Value *vptr, MethodInfo &info);
+-  static uint32_t nNextSeq;
+-};
+-uint32_t LabelCallBase::nNextSeq = 0;
+-
+-class LabelCallInst : public LabelCallBase {
+-  CallInst *I;
+-
+-public:
+-  LabelCallInst(CallInst *I) : I(I) {}
+-  virtual Instruction *getInstruction() { return I; }
+-  virtual Value *getVPtr(int idx) { return I->getArgOperand(idx); }
+-  virtual Function *getCallee() { return I->getCalledFunction(); }
+-
+-  virtual bool labelIndirectCall(MethodInfo &info);
+-};
+-
+-class LabelInvokeInst : public LabelCallBase {
+-  InvokeInst *I;
+-
+-public:
+-  LabelInvokeInst(InvokeInst *I) : I(I) {}
+-  virtual Instruction *getInstruction() { return I; }
+-  virtual Value *getVPtr(int idx) { return I->getArgOperand(idx); }
+-  virtual Function *getCallee() { return I->getCalledFunction(); }
+-};
+-
+ #define SAN_TAG_STR "__VLOOM_SANITIZE_"
+ #define SAN_TAG_LEN strlen(SAN_TAG_STR)
+ #define PH_DELM_STR "_PH_"
+ #define PH_DELM_LEN strlen(PH_DELM_STR)
+ 
+-class VloomPass : public ModulePass {
+-  friend LabelCallBase;
+-
++class VloomPass : public ModulePass
++{
+   static char ID;  // pass ID
+   Module *thisMod; // current module
+ 
+@@ -133,10 +83,7 @@ class VloomPass : public ModulePass {
+   unsigned mScratchRegset = 1;
+   uint32_t mVloomSize = 64; // 64 bytes nop-sled
+   uint32_t mScratchRegs = 3;
+-
+-  uint32_t nVCallSeq, nRetSeq, nNextSeq;
+-  static bool mUnprotAllRET, mUnprotNonvRET;
+-
++  uint32_t nVCallSeq;
+   /* buffers used to do formating */
+   char *szTempBuf;
+ 
+@@ -144,17 +91,9 @@ class VloomPass : public ModulePass {
+   std::set<long> setVTables;
+ 
+ public:
+-  VloomPass() : ModulePass(ID), setVTables({}) {
+-    /* initialize sequce number needed for setting tags */
+-    nVCallSeq = 0x10000;
+-    nRetSeq = 0x40000;
+-    nNextSeq = 0x70000;
+-    LabelCallBase::nNextSeq = nNextSeq;
+-
+-    // hope 512 bytes is enough
+-    szTempBuf = (char *)malloc(512);
+-
+-    mUnprotAllRET = mUnprotNonvRET = false;
++  VloomPass() : ModulePass(ID), setVTables({})
++  {
++    szTempBuf = (char*)malloc(1024);
+   }
+ 
+   ~VloomPass() { free(szTempBuf); }
+@@ -167,12 +106,12 @@ public:
+ 
+   /* Do instrumentation for vcalls, and generate labels before CXXMehod calls */
+   void handleCXXMethodCalls(Function &F, vector<Instruction *> &Dels);
+-  void instrumentVirtualCall(LabelCallBase *labelObj, MethodInfo &info);
+-
+-  /* Instrument before CXXMethod returns */
+-  void instrumentMethodRets(Function &F);
++  void instrumentVirtualCall(CallInst *C);
++  void instrumentVirtualCall(InvokeInst *I);
++  void _instrumentVirtualCall(Instruction *I, Function *callee, Value *VPtr);
+ 
+-  virtual bool runOnModule(Module &M) {
++  virtual bool runOnModule(Module &M)
++  {
+     // Get environment variables
+     initVloom(M);
+ 
+@@ -180,7 +119,8 @@ public:
+     if (VloomDisabled)
+       return false; //  no changes
+ 
+-    if (getenv("VLOOM_PASS_DEBUG") != nullptr) {
++    if (getenv("VLOOM_PASS_DEBUG") != nullptr)
++    {
+       std::string outName(M.getName());
+       outName += ".vloom.in.ll";
+       std::error_code EC;
+@@ -190,7 +130,8 @@ public:
+ 
+     /* Process CALL instructions */
+     std::vector<Instruction *> DelFlagCalls;
+-    for (auto &F : M) {
++    for (auto &F : M)
++    {
+       if (F.isDeclaration())
+         continue;
+       handleCXXMethodCalls(F, DelFlagCalls);
+@@ -199,25 +140,20 @@ public:
+     for (auto *I : DelFlagCalls)
+       I->eraseFromParent();
+ 
+-    /* Process RET instructions */
+-    if (!mUnprotAllRET) {
+-      for (auto &F : M)
+-        instrumentMethodRets(F);
+-    }
+     return true;
+   }
+ };
+ 
+ char VloomPass::ID = 0;
+-bool VloomPass::mUnprotAllRET = false;
+-bool VloomPass::mUnprotNonvRET = false;
+ 
+-namespace llvm {
+-ModulePass *createVloomPass() { return new VloomPass(); }
++namespace llvm
++{
++  ModulePass *createVloomPass() { return new VloomPass(); }
+ } // namespace llvm
+ 
+ /* copy from ItaniumCXXABI.cpp */
+-void VloomPass::initVloom(Module &M) {
++void VloomPass::initVloom(Module &M)
++{
+   thisMod = &M;
+ 
+   const char *vstr = getenv("VLOOM_DISABLED");
+@@ -233,14 +169,6 @@ void VloomPass::initVloom(Module &M) {
+     mScratchRegset = atoi(vstr);
+   assert(mScratchRegset == 1 || mScratchRegset == 2);
+ 
+-  vstr = getenv("VLOOM_NOALLRET");
+-  if ((vstr != NULL) && (strncmp(vstr, "1", 2) == 0))
+-    mUnprotAllRET = true;
+-
+-  vstr = getenv("VLOOM_NONONVRET");
+-  if ((vstr != NULL) && (strncmp(vstr, "1", 2) == 0))
+-    mUnprotNonvRET = true;
+-
+   vstr = getenv("VLOOM_SIZE");
+   if (vstr != NULL)
+     mVloomSize = atoi(vstr);
+@@ -256,28 +184,29 @@ void VloomPass::initVloom(Module &M) {
+     srandom(0x70000);
+   else
+     srandom((uint)time(NULL));
+-
+   nVCallSeq = random() & 0x0FFFFFFF;
+-  nRetSeq = random() & 0x0FFFFFFF;
+-  nNextSeq = random() & 0x0FFFFFFF;
+-  LabelCallBase::nNextSeq = nNextSeq;
+ }
+ 
+ /* Append nop instructions into asmStr */
+-bool VloomPass::appendNops(std::string &asmStr, unsigned nops) {
+-  while (nops >= 8) {
++bool VloomPass::appendNops(std::string &asmStr, unsigned nops)
++{
++  while (nops >= 8)
++  {
+     asmStr += ".byte 0x0F,0x1F,0x84,0x00,0x00,0x00,0x00,0x00\n";
+     nops -= 8;
+   }
+-  while (nops >= 4) {
++  while (nops >= 4)
++  {
+     asmStr += ".byte 0x0F,0x1F,0x40,0x00\n";
+     nops -= 4;
+   }
+-  while (nops >= 2) {
++  while (nops >= 2)
++  {
+     asmStr += ".byte 0x66,0x90\n";
+     nops -= 2;
+   }
+-  while (nops >= 1) {
++  while (nops >= 1)
++  {
+     asmStr += ".byte 0x90\n";
+     nops -= 1;
+   }
+@@ -285,7 +214,8 @@ bool VloomPass::appendNops(std::string &asmStr, unsigned nops) {
+ }
+ 
+ /* A simple wrapper of sprintf */
+-char *VloomPass::mysprintf(const char *fmt, ...) {
++char *VloomPass::mysprintf(const char *fmt, ...)
++{
+   va_list va;
+   va_start(va, fmt);
+   vsprintf(szTempBuf, fmt, va);
+@@ -299,89 +229,55 @@ char *VloomPass::mysprintf(const char *fmt, ...) {
+  * @param F
+  * @param Dels Some CALL instructions are used as flags, they would be removed
+  */
+-void VloomPass::handleCXXMethodCalls(Function &F, vector<Instruction *> &Dels) {
+-  std::set<const Instruction *> setCalls;
+-  MethodInfo info;
+-
++void VloomPass::handleCXXMethodCalls(Function &F, vector<Instruction *> &Dels)
++{
+   setVTables.clear();
+-  for (Function::iterator BN = F.begin(), BE = F.end(); BN != BE; BN++) {
++  for (Function::iterator BN = F.begin(), BE = F.end(); BN != BE; BN++)
++  {
+     BasicBlock &BB = *BN;
+-    for (BasicBlock::iterator IN = BB.begin(), IE = BB.end(); IN != IE; IN++) {
+-
++    for (BasicBlock::iterator IN = BB.begin(), IE = BB.end(); IN != IE; IN++)
++    {
+       /* We only care about InvokeInst and CallInst */
++      Function *callee = nullptr;
++      InvokeInst *I = nullptr;
++      CallInst *C = nullptr;
+       bool bCallBase = false;
+-      switch (IN->getOpcode()) {
++      switch (IN->getOpcode())
++      {
+       default:
+         bCallBase = false;
+         break;
+       case Instruction::Call:
++        C = dyn_cast<CallInst>(IN);
++        callee = C->getCalledFunction();
++        bCallBase = true;
++        break;
+       case Instruction::Invoke:
++        I = dyn_cast<InvokeInst>(IN);
++        callee = I->getCalledFunction();
+         bCallBase = true;
+         break;
+       }
+-      if (!bCallBase)
++      if (!bCallBase || callee == nullptr || !callee->hasName())
+         continue;
+ 
+-      /* already processed */
+-      if (setCalls.find(&*IN) == setCalls.end())
+-        setCalls.insert(&*IN);
+-      else
+-        continue;
+-
+-      LabelCallBase *labelObj;
+-      if (IN->getOpcode() == Instruction::Call)
+-        labelObj = new LabelCallInst(dyn_cast<CallInst>(IN));
+-      else if (IN->getOpcode() == Instruction::Invoke)
+-        labelObj = new LabelInvokeInst(dyn_cast<InvokeInst>(IN));
+-      else
+-        asm("ud2");
+-
+-      info.bFreeMe = false;
+-      /* VCALLs ? */
+-      if (IN->getMetadata("typed-VCALL")) {
+-        info.bVirtual = true;
+-        labelObj->labelVirtualCall(info);
+-        if (info.bFreeMe) {
+-          free(info.pClassName);
+-          free(info.pFuncName);
+-        }
+-        continue;
+-      }
+-
+-      /* Other kinds of indirect calls ? */
+-      Function *callee = labelObj->getCallee();
+-      if (callee == nullptr || !callee->hasName()) {
+-        info.bVirtual = false;
+-        labelObj->labelIndirectCall(info);
+-        if (info.bFreeMe) {
+-          free(info.pClassName);
+-          free(info.pFuncName);
+-        }
+-        continue;
+-      }
+-
+       StringRef name = callee->getName();
+       // A flag CALL instruction?
+-      if (name.startswith(SAN_TAG_STR)) {
+-        instrumentVirtualCall(labelObj, info);
+-        Dels.push_back(&*IN);
+-        continue;
+-      }
++      if (name.startswith(SAN_TAG_STR))
++      {
++        if (C)
++          instrumentVirtualCall(C);
++        else
++          instrumentVirtualCall(I);
+ 
+-      /* Other direct calls ? */
+-      info.bVirtual = false;
+-      labelObj->labelDirectCall(info);
+-      if (info.bFreeMe) {
+-        free(info.pClassName);
+-        free(info.pFuncName);
++        Dels.push_back(&*IN);
+       }
+-
+-      delete labelObj;
+     }
+   }
+ }
+ 
+-const char *VloomPass::selectASMFlags(size_t nScratchRegs, bool bVcall) {
++const char *VloomPass::selectASMFlags(size_t nScratchRegs, bool bVcall)
++{
+   static const char *GPRSR_flags[2][4] = {
+       {
+           "{rdi},~{dirflag},~{fpsr},~{flags}",
+@@ -410,11 +306,12 @@ const char *VloomPass::selectASMFlags(size_t nScratchRegs, bool bVcall) {
+           "={rdi},{rdi},~{r11},~{r10},~{r9},~{dirflag},~{fpsr},~{flags}",
+       }};
+ 
+-  // uint idx = bVcall ? 1 : 0;
+-  uint idx = 0;
++
++  uint idx = bVcall ? 1 : 0;
+   const char *(*arr)[2][4], *asmFlags;
+ 
+-  switch (mScratchRegset) {
++  switch (mScratchRegset)
++  {
+   case 1:
+     arr = &GPRSR_flags;
+     break;
+@@ -426,7 +323,8 @@ const char *VloomPass::selectASMFlags(size_t nScratchRegs, bool bVcall) {
+     break;
+   }
+ 
+-  switch (mVloomMode) {
++  switch (mVloomMode)
++  {
+   case VLOOM_FLAG:
+   case VLOOM_TRACE:
+     asmFlags = (*arr)[idx][0];
+@@ -446,18 +344,24 @@ const char *VloomPass::selectASMFlags(size_t nScratchRegs, bool bVcall) {
+  * @param F
+  * @param info return some information
+  */
+-void VloomPass::instrumentVirtualCall(LabelCallBase *labelObj,
+-                                      MethodInfo &info) {
+-  Function *callee = labelObj->getCallee();
+-  Value *VPtr = labelObj->getVPtr(0);
+-
+-  if (isa<Constant>(VPtr)) {
+-    // If the VPTR is a constant, then we can assume it is correct.
+-    // (The compiler-is-correct assumption).
+-    return;
+-  }
+ 
+-  // Optimization: in a function check VTable once only
++void VloomPass::instrumentVirtualCall(CallInst *C)
++{
++  Function *callee = C->getCalledFunction();
++  Value *VPtr = C->getArgOperand(0);
++  _instrumentVirtualCall(C, callee, VPtr);
++}
++
++void VloomPass::instrumentVirtualCall(InvokeInst *I)
++{
++  Function *callee = I->getCalledFunction();
++  Value *VPtr = I->getArgOperand(0);
++  _instrumentVirtualCall(I, callee, VPtr);
++}
++
++void VloomPass::_instrumentVirtualCall(Instruction *I, Function *callee, Value *VPtr)
++{
++  // Agressive optimization: in a function check VTable once only
+   long hash = (long)VPtr->getType();
+   hash += VPtr->getRawSubclassOptionalData();
+   hash += VPtr->getValueID();
+@@ -494,7 +398,8 @@ void VloomPass::instrumentVirtualCall(LabelCallBase *labelObj,
+   char szNops[64];
+   unsigned nops;
+ 
+-  switch (mVloomMode) {
++  switch (mVloomMode)
++  {
+   case VLOOM_FLAG:
+     nRegNum = 0;
+     nNopSize = 8; // sizeof("ud2\nint3\nud2\nint3\n") + short-jump
+@@ -516,7 +421,8 @@ void VloomPass::instrumentVirtualCall(LabelCallBase *labelObj,
+   const char *szPoison = "ud2\nint3\nud2\nint3\n";
+   const char *jmpFmt = ".byte 0xEB,0x%x\n";
+ 
+-  switch (mVloomMode) {
++  switch (mVloomMode)
++  {
+   case VLOOM_COMP: // COMPATIBLE_MODE
+   case VLOOM_FLAG: // FLAG_MODE
+   case VLOOM_TRACE:
+@@ -536,9 +442,11 @@ void VloomPass::instrumentVirtualCall(LabelCallBase *labelObj,
+ 
+   // output config information: nRegNum : VLOOM_REGSTER_SET:
+   // VLOOM_SIDE_EFFECT
+-  if (nops >= 5) {
++  if (nops >= 5)
++  {
+     const char *encodeFmt = ".byte 0xb8, %2d, %2d, %2d, %2d\n";
+-    switch (mVloomMode) {
++    switch (mVloomMode)
++    {
+     case VLOOM_TRACE:
+       *(unsigned *)(szNops + 32) = rand();
+       sprintf(szNops, encodeFmt, szNops[32], szNops[33], szNops[34],
+@@ -568,259 +476,20 @@ void VloomPass::instrumentVirtualCall(LabelCallBase *labelObj,
+     break;
+   }
+ 
+-  IRBuilder<> B(labelObj->getInstruction());
++  // Full checking scheme
++  // IRBuilder<> B(I);
++  // llvm::FunctionType *AsmTy =
++  //     llvm::FunctionType::get(VPtr->getType(), {VPtr->getType()}, false);
++  // const char *asmFlags = selectASMFlags(nRegNum, true);
++  // auto *AsmFunc = llvm::InlineAsm::get(AsmTy, asmStr, asmFlags, false);
++  // VPtr = B.CreateCall(AsmFunc, {VPtr});
++  // I->replaceAllUsesWith(VPtr);
++
++  // Optimization scheme
++  IRBuilder<> B(I);
+   llvm::FunctionType *AsmTy =
+       llvm::FunctionType::get(B.getVoidTy(), {VPtr->getType()}, false);
+-  const char *asmFlags = selectASMFlags(nRegNum, true);
++  const char *asmFlags = selectASMFlags(nRegNum, false); // false
+   auto *AsmFunc = llvm::InlineAsm::get(AsmTy, asmStr, asmFlags, false);
+   B.CreateCall(AsmFunc, {VPtr});
+ }
+-
+-bool LabelCallBase::labelVirtualCall(MethodInfo &info) {
+-  // extract information from metadata
+-  Instruction *I = getInstruction();
+-  MDNode *N = I->getMetadata("typed-VCALL");
+-  StringRef infoStr = cast<MDString>(N->getOperand(0))->getString();
+-  SmallVector<StringRef, 4> vecFS;
+-  infoStr.split(vecFS, PH_DELM_STR);
+-
+-  assert(vecFS.size() == 3);
+-  std::string strClassName = vecFS[1];
+-  std::string strFuncName = vecFS[2];
+-  ulong nArgs = I->getNumOperands() - 1;
+-
+-  info.pClassName = strdup(strClassName.data());
+-  info.pFuncName = strdup(strFuncName.data());
+-  info.nArgs = nArgs;
+-  info.bVirtual = true;
+-  info.bFreeMe = true;
+-
+-  return _emitCallLabel(I, NULL, info);
+-}
+-
+-void VloomPass::instrumentMethodRets(Function &F) {
+-  // currently only instrument RETs of instance functions
+-  if (!F.bCXXMethod || !F.bInstance)
+-    return;
+-  if (VloomPass::mUnprotNonvRET && !F.bVirtual)
+-    return;
+-
+-  /* Currently we don't distinguish operator overloading */
+-  StringRef fname = F.strFuncName;
+-  if (fname.startswith("~"))
+-    return; // don't protect destructors
+-  else if (fname.startswith("operator"))
+-    fname = "operator";
+-
+-  std::string classname = F.strClassName;
+-  std::string funcname = fname.data();
+-
+-  for (Function::iterator I = F.begin(), E = F.end(); I != E;) {
+-    BasicBlock *BB = &*I++;
+-    ReturnInst *RI = dyn_cast<ReturnInst>(BB->getTerminator());
+-    if (!RI)
+-      continue;
+-
+-    /* instrument nop-sled for place holding */
+-    const char *asmFlags = selectASMFlags(mScratchRegs, false);
+-    const char *jmpFmt = ".byte 0xEB,0x%x\n";
+-
+-    std::string asmStr;
+-    // Jump over nops
+-    asmStr += mysprintf(jmpFmt, mVloomSize - 2);
+-    // append nop-sleds
+-    appendNops(asmStr, mVloomSize - 2);
+-
+-    std::string label;
+-    if (F.bVirtual)
+-      label = mysprintf("__VLOOM_RETV_S%d_R%d_PH_", mVloomSize, mScratchRegs);
+-    else
+-      label = mysprintf("__VLOOM_RETD_S%d_R%d_PH_", mVloomSize, mScratchRegs);
+-
+-    label += classname + PH_DELM_STR + funcname;
+-    label += mysprintf("_PH_%d", F.arg_size());
+-    label += mysprintf("_PH_%d", nRetSeq++);
+-    encode_special_characters(label);
+-    asmStr += "\n.weak ";
+-    asmStr += label + "\n" + ".hidden " + label + "\n" + label + ":\n";
+-
+-    IRBuilder<> B(RI);
+-    Function *RetTy =
+-        Intrinsic::getDeclaration(RI->getModule(), Intrinsic::returnaddress);
+-    Value *retval = B.CreateCall(RetTy, B.getInt32(0));
+-
+-    llvm::FunctionType *AsmTy =
+-        llvm::FunctionType::get(B.getVoidTy(), {RetTy->getReturnType()}, false);
+-    auto *AsmFunc = llvm::InlineAsm::get(AsmTy, asmStr, asmFlags, false);
+-    B.CreateCall(AsmFunc, {retval});
+-  }
+-}
+-
+-bool LabelCallBase::labelDirectCall(MethodInfo &info) {
+-  Function *ee = getCallee();
+-  if (!ee || !ee->hasName())
+-    return false;
+-
+-  if (ee->isDeclaration())
+-    return labelDSOSymbol(ee);
+-  else if (!ee->bCXXMethod || !ee->bInstance)
+-    return false;
+-
+-  info.pClassName = strdup(ee->strClassName.data());
+-  info.pFuncName = strdup(ee->strFuncName.data());
+-  info.nArgs = ee->arg_size();
+-  info.bVirtual = false;
+-  info.bFreeMe = true;
+-  Instruction *I = getInstruction();
+-  Value *vptr = getVPtr(0);
+-  return _emitCallLabel(I, vptr, info);
+-}
+-
+-bool LabelCallBase::labelDSOSymbol(Function *ee) {
+-  if (ee->strFuncName.empty()) // should not be empty for CXXMethodDecl
+-    return false;
+-
+-  llvm::FunctionType *FTy = ee->getFunctionType();
+-  int nFuncParams = FTy->getNumParams();
+-  if (nFuncParams < 1) // At least 1 parameter for THIS-call
+-    return false;
+-
+-  // call void @_ZNK16StraightBoundaryILxxx(%class.Point* sret(%class.Point) %0,
+-  // %class.StraightBoundary* %6, %class.TriaIterator* %2)
+-  // _ZNSt8ios_base4InitC1Ev(%"class.std::ios_base::Init"*)
+-  StringRef strFunc;
+-  if (ee->getName().startswith("_ZNK"))
+-    strFunc = ee->getName().drop_front(4);
+-  else if (ee->getName().startswith("_ZN"))
+-    strFunc = ee->getName().drop_front(3);
+-  else {
+-    printf("unexpect name:%s\n", strFunc.data());
+-    return false;
+-  }
+-
+-  bool bMatched = false;
+-  int nParamIdx = 0;
+-  StructType *stTy;
+-
+-  for (int idx = 0; idx < 2 && idx < nFuncParams && !bMatched; idx++) {
+-    llvm::Type *opTy = FTy->getParamType(idx);
+-    PointerType *ptTy = dyn_cast<PointerType>(opTy);
+-    if (!ptTy)
+-      return false;
+-
+-    llvm::Type *emTy = ptTy->getElementType();
+-    stTy = dyn_cast<StructType>(emTy);
+-    if (!stTy || !stTy->pMangledName)
+-      return false;
+-
+-    // _ZTV16StraightBoundaryILi3EE
+-    // _ZTVNSt8ios_base4InitE
+-    StringRef strStName = stTy->pMangledName;
+-    StringRef strST;
+-    if (strStName.startswith("_ZTVN"))
+-      strST = strStName.drop_front(5);
+-    else if (strStName.startswith("_ZTV"))
+-      strST = strStName.drop_front(4);
+-    else {
+-      printf("unexpect type:%s\n", strST.data());
+-      return false;
+-    }
+-
+-    size_t oft = strST.find_last_not_of('E');
+-    if (oft != StringRef::npos)
+-      strST = strST.take_front(oft);
+-
+-    if (strFunc.startswith(strST)) {
+-      bMatched = true;
+-      nParamIdx = idx;
+-    } else {
+-      printf("mismatch:%s -> %s\n", ee->getName().data(), strStName.data());
+-    }
+-  }
+-  if (!bMatched) {
+-    printf("unexpect dso-call\n");
+-    return false;
+-  }
+-
+-  Value *vptr = getVPtr(nParamIdx);
+-  if (!vptr)
+-    return false;
+-
+-  MethodInfo info;
+-  info.pClassName = strdup(stTy->pMangledName);
+-  info.pFuncName = strdup(ee->strFuncName.data());
+-  info.nArgs = FTy->getNumParams();
+-  info.bVirtual = true;
+-  Instruction *I = getInstruction();
+-  _emitCallLabel(I, vptr, info);
+-
+-  return true;
+-}
+-
+-/**
+- * @brief Emit a CALL instruction used as a label
+- * Although we may not protect RETs of non-virutal functions,
+- * We still need to emit __VLOOM_NEXTD labels. Because
+- * compiler sometime emits codes that use direct calls to call virtual
+- * functions.
+- * @param I
+- * @param vptr
+- * @param info
+- * @return true
+- * @return false
+- */
+-bool LabelCallBase::_emitCallLabel(Instruction *I, Value *vptr,
+-                                   MethodInfo &info) {
+-  StringRef funcname = info.pFuncName;
+-  /* Currently we don't distinguish operator overloading */
+-  if (funcname.startswith("operator"))
+-    funcname = "operator";
+-
+-  std::string tmpClStr = info.pClassName;
+-  std::string tmpFcStr = funcname.data();
+-  std::string label;
+-  if (funcname.startswith("thiscall"))
+-    label = "__VLOOM_NEXTP";
+-  else if (info.bVirtual)
+-    label = "__VLOOM_NEXTV";
+-  else
+-    label = "__VLOOM_NEXTD";
+-
+-  label += tmpClStr + PH_DELM_STR + tmpFcStr + PH_DELM_STR +
+-           std::to_string(info.nArgs);
+-  // +PH_DELM_STR + std::to_string(nNextSeq++);
+-  encode_special_characters(label);
+-
+-  LLVMContext &C = I->getContext();
+-  MDNode *N = MDNode::get(C, MDString::get(C, label));
+-  I->setMetadata("typed-CFI", N);
+-  I->DbgLoc.CFILabel = N;
+-
+-  return true;
+-}
+-
+-// label weird this-call
+-bool LabelCallInst::labelIndirectCall(MethodInfo &info) {
+-  if (I->getNumArgOperands() < 1) // At least 1 parameter for THIS-call
+-    return false;
+-
+-  Value *thisObj = I->getOperand(0);
+-  llvm::Type *opTy = thisObj->getType();
+-  PointerType *ptTy = dyn_cast<PointerType>(opTy);
+-  if (!ptTy)
+-    return false;
+-
+-  llvm::Type *emTy = ptTy->getElementType();
+-  StructType *stTy = dyn_cast<StructType>(emTy);
+-  if (!stTy || !stTy->pMangledName)
+-    return false;
+-
+-  info.pClassName = strdup(stTy->pMangledName);
+-  info.pFuncName = strdup("thiscall");
+-  info.nArgs = I->getNumArgOperands();
+-  info.bVirtual = true;
+-  info.bFreeMe = true;
+-  _emitCallLabel(I, thisObj, info);
+-
+-  return true;
+-}
+\ No newline at end of file
+diff --git a/llvm-7.1.0.src/tools/clang/lib/Basic/Version.cpp b/llvm-7.1.0.src/tools/clang/lib/Basic/Version.cpp
+index b25cbd9fd..c2b7753d4 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/Basic/Version.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/Basic/Version.cpp
+@@ -36,7 +36,7 @@ std::string getClangRepositoryPath() {
+ 
+   // If the SVN_REPOSITORY is empty, try to use the SVN keyword. This helps us
+   // pick up a tag in an SVN export, for example.
+-  StringRef SVNRepository("$URL: https://llvm.org/svn/llvm-project/cfe/tags/RELEASE_710/final/lib/Basic/Version.cpp $");
++  StringRef SVNRepository("$URL$");
+   if (URL.empty()) {
+     URL = SVNRepository.slice(SVNRepository.find(':'),
+                               SVNRepository.find("/lib/Basic"));
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGCall.cpp b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGCall.cpp
+index f45655e31..fa51dc30c 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGCall.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGCall.cpp
+@@ -3785,7 +3785,6 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
+                                  const CallArgList &CallArgs,
+                                  llvm::Instruction **callOrInvoke,
+                                  SourceLocation Loc) {
+-  MDVCallLabel = nullptr;
+   // FIXME: We no longer need the types from CallArgs; lift up and simplify.
+ 
+   assert(Callee.isOrdinary() || Callee.isVirtual());
+@@ -4306,8 +4305,6 @@ RValue CodeGenFunction::EmitCall(const CGFunctionInfo &CallInfo,
+   llvm::Instruction *CI = CS.getInstruction();
+   if (callOrInvoke)
+     *callOrInvoke = CI;
+-  CI->setMetadata("typed-VCALL", MDVCallLabel);
+-  CI->DbgLoc.CFILabel = MDVCallLabel;
+ 
+   // Apply the attributes and calling convention.
+   CS.setAttributes(Attrs);
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGClass.cpp b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGClass.cpp
+index ec4eb000a..ef60c81f2 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGClass.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CGClass.cpp
+@@ -2717,8 +2717,13 @@ void CodeGenFunction::EmitVTablePtrCheck(const CXXRecordDecl *RD,
+   llvm::Value *TypeId = llvm::MetadataAsValue::get(getLLVMContext(), MD);
+ 
+   llvm::Value *CastedVTable = Builder.CreateBitCast(VTable, Int8PtrTy);
+-  llvm::Value *TypeTest = Builder.CreateCall(
+-      CGM.getIntrinsic(llvm::Intrinsic::type_test), {CastedVTable, TypeId});
++
++  llvm::Value *TypeTest;
++  if (getenv("NOFASTVCFI") == NULL)
++    TypeTest = Builder.CreateCall(CGM.getIntrinsic(llvm::Intrinsic::type_test),
++                                  {CastedVTable, TypeId});
++  else
++    TypeTest = Builder.getIntN(1, 0);
+ 
+   llvm::Constant *StaticData[] = {
+       llvm::ConstantInt::get(Int8Ty, TCK),
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.cpp b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.cpp
+index 1a64ea3d8..166d588dd 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.cpp
+@@ -1178,25 +1178,9 @@ void CodeGenFunction::StartFunction(GlobalDecl GD,
+ 
+   // TODO: Do we need to handle this in two places like we do with
+   // target-features/target-cpu?
+-  if (CurFuncDecl) {
++  if (CurFuncDecl)
+     if (const auto *VecWidth = CurFuncDecl->getAttr<MinVectorWidthAttr>())
+       LargestVectorWidth = VecWidth->getVectorWidth();
+-
+-    MangleContext &ctx = CGM.getCXXABI().getMangleContext();
+-    auto itctx = dyn_cast<ItaniumMangleContext>(&ctx);
+-    auto md = dyn_cast<CXXMethodDecl>(CurFuncDecl);
+-    if (itctx && md && md->isUserProvided()) {
+-      CurFn->bCXXMethod = true;
+-      CurFn->bInstance = md->isInstance();
+-      CurFn->bVirtual = md->isVirtual();
+-      const CXXRecordDecl *cl = md->getParent();
+-      SmallString<256> name;
+-      llvm::raw_svector_ostream StreamD(name);
+-      itctx->mangleCXXVTable(cl, StreamD);
+-      CurFn->strClassName = name.c_str();
+-      CurFn->strFuncName = md->getNameAsString();
+-    }
+-  }
+ }
+ 
+ void CodeGenFunction::EmitFunctionBody(FunctionArgList &Args,
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.h b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.h
+index 502472094..d374f3943 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.h
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenFunction.h
+@@ -228,9 +228,6 @@ class CodeGenFunction : public CodeGenTypeCache {
+   void operator=(const CodeGenFunction &) = delete;
+ 
+   friend class CGCXXABI;
+-public:
+-  llvm::MDNode *MDVCallLabel = nullptr;
+-
+ public:
+   /// A jump destination is an abstract label, branching to which may
+   /// require a jump out through normal cleanups.
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenModule.cpp b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenModule.cpp
+index 8d55a13f1..2b9395e39 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenModule.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenModule.cpp
+@@ -2667,10 +2667,6 @@ llvm::Constant *CodeGenModule::GetOrCreateLLVMFunction(
+   llvm::Function *F =
+       llvm::Function::Create(FTy, llvm::Function::ExternalLinkage,
+                              Entry ? StringRef() : MangledName, &getModule());
+-  if (D && isa<CXXMethodDecl>(D)) {
+-    auto md = dyn_cast<CXXMethodDecl>(D);
+-    F->strFuncName = md->getNameAsString();
+-  }
+ 
+   // If we already created a function with the same mangled name (but different
+   // type) before, take its name and add it to the list of functions to be
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenTypes.cpp b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenTypes.cpp
+index 13dd49556..1a1395e6a 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenTypes.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/CodeGenTypes.cpp
+@@ -701,19 +701,6 @@ llvm::StructType *CodeGenTypes::ConvertRecordDeclType(const RecordDecl *RD) {
+   if (!Entry) {
+     Entry = llvm::StructType::create(getLLVMContext());
+     addRecordTypeName(RD, Entry, "");
+-
+-    ItaniumMangleContext *MC =
+-        dyn_cast<ItaniumMangleContext>(&CGM.getCXXABI().getMangleContext());
+-    const CXXRecordDecl *CRD = dyn_cast<CXXRecordDecl>(RD);
+-    if (MC && CRD) {
+-      SmallString<256> Buffer;
+-      llvm::raw_svector_ostream Out(Buffer);
+-
+-      MC->mangleCXXVTable(CRD, Out);
+-      size_t nLen = (Buffer.size() + 7);
+-      Entry->pMangledName = (char *)malloc((nLen << 3) >> 3);
+-      strcpy(Entry->pMangledName, Buffer.c_str());
+-    }
+   }
+   llvm::StructType *Ty = Entry;
+ 
+diff --git a/llvm-7.1.0.src/tools/clang/lib/CodeGen/ItaniumCXXABI.cpp b/llvm-7.1.0.src/tools/clang/lib/CodeGen/ItaniumCXXABI.cpp
+index daaa53a04..76811b546 100644
+--- a/llvm-7.1.0.src/tools/clang/lib/CodeGen/ItaniumCXXABI.cpp
++++ b/llvm-7.1.0.src/tools/clang/lib/CodeGen/ItaniumCXXABI.cpp
+@@ -25,19 +25,17 @@
+ #include "CodeGenFunction.h"
+ #include "CodeGenModule.h"
+ #include "TargetInfo.h"
++#include "clang/CodeGen/ConstantInitBuilder.h"
+ #include "clang/AST/Mangle.h"
+-#include "clang/AST/StmtCXX.h"
+ #include "clang/AST/Type.h"
+-#include "clang/CodeGen/ConstantInitBuilder.h"
++#include "clang/AST/StmtCXX.h"
+ #include "llvm/IR/CallSite.h"
+ #include "llvm/IR/DataLayout.h"
+ #include "llvm/IR/GlobalValue.h"
+-#include "llvm/IR/InlineAsm.h"
+ #include "llvm/IR/Instructions.h"
+ #include "llvm/IR/Intrinsics.h"
+ #include "llvm/IR/Value.h"
+ #include "llvm/Support/ScopedPrinter.h"
+-#include "llvm/IR/BasicBlock.h"
+ 
+ using namespace clang;
+ using namespace CodeGen;
+@@ -68,7 +66,7 @@ public:
+   ItaniumCXXABI(CodeGen::CodeGenModule &CGM, bool UseARMMethodPtrABI = false,
+                 bool UseARMGuardVarABI = false)
+       : CGCXXABI(CGM), UseARMMethodPtrABI(UseARMMethodPtrABI),
+-        UseARMGuardVarABI(UseARMGuardVarABI), Use32BitVTableOffsetABI(false){
++        UseARMGuardVarABI(UseARMGuardVarABI), Use32BitVTableOffsetABI(false) {
+     initVloom();
+   }
+ 
+@@ -1568,8 +1566,7 @@ void ItaniumCXXABI::EmitDestructorCall(CodeGenFunction &CGF,
+                                   nullptr);
+ }
+ 
+-static void encode_dollar_symbol(SmallString<256> &str)
+-{
++static void encode_dollar_symbol(SmallString<256> &str) {
+ #define DOLLAR_SYM "DollaR"
+ #define DOLLAR_LEN 6
+ 
+@@ -1794,8 +1791,8 @@ llvm::GlobalVariable *ItaniumCXXABI::getAddrOfVTable(const CXXRecordDecl *RD,
+ bool gbVloomInited = false;
+ void ItaniumCXXABI::initVloom(void) {
+   VloomDisabled = false; // enabled by default
+-  VloomSize = 64;  // 64 bytes nop-sled
+-  VloomRegs = 2;   // two scratch registers
++  VloomSize = 64;        // 64 bytes nop-sled
++  VloomRegs = 2;         // two scratch registers
+ 
+   const char *vstr = getenv("VLOOM_DISABLED");
+   if ((vstr != NULL) && (strncmp(vstr, "1", 2) == 0))
+@@ -1841,10 +1838,10 @@ CGCallee ItaniumCXXABI::getVirtualFunctionPointer(CodeGenFunction &CGF,
+ 
+       // Hack to align the data segments so that they cannot overlap with
+       // the (.text) segment, which causes problems for XOM.
+-      // CGM.getModule().appendModuleInlineAsm(".section .rodata\n"
+-      //                                       ".balign 0x1000\n"
+-      //                                       ".section .data\n"
+-      //                                       ".balign 0x1000\n");
++      CGM.getModule().appendModuleInlineAsm(".section .rodata\n"
++                                            ".balign 0x1000\n"
++                                            ".section .data\n"
++                                            ".balign 0x1000\n");
+     }
+ 
+     if (!VloomDisabled) {
+@@ -1856,33 +1853,33 @@ CGCallee ItaniumCXXABI::getVirtualFunctionPointer(CodeGenFunction &CGF,
+       std::string strSanitizer("__VLOOM_SANITIZE_");
+       strSanitizer += "_PH_";
+       strSanitizer += strClassName;
+-      // strSanitizer += "_PH_";
+-      // strSanitizer += std::to_string(nSanSeq++);
++      strSanitizer += "_PH_";
++      strSanitizer += std::to_string(nSanSeq++);
+ 
+-      auto *Sanitizer = CGM.getModule().getOrInsertFunction(
+-          strSanitizer, CGM.VoidTy, VTable->getType());
++      // Full checking scheme
++      // auto *Sanitizer = CGM.getModule().getOrInsertFunction(
++      //     strSanitizer, VTable->getType(), VTable->getType());
+       // if (auto *Func = llvm::dyn_cast<llvm::Function>(Sanitizer)) {
+       //   Func->setDoesNotAccessMemory(); // Lie!
+       //   Func->setDoesNotThrow();
+       //   Func->setLinkage(llvm::GlobalValue::ExternalLinkage);
+       // }
+-      CGF.Builder.CreateCall(Sanitizer, {VTable});
+-
+-      // 2. label: __VLOOM_SANITIZE__PH__ZTV15FormatterToText_PH_characters
+-      std::string strLabel = "__VLOOM_SANITIZE_";
+-      strLabel += "_PH_";
+-      strLabel += strClassName;
+-      strLabel += "_PH_";
+-      strLabel += MethodDecl->getNameAsString();
++      // VTable = CGF.Builder.CreateCall(Sanitizer, {VTable});
+ 
+-      llvm::LLVMContext &C = CGF.getLLVMContext();
+-      llvm::MDNode *N = llvm::MDNode::get(C, llvm::MDString::get(C, strLabel));
+-      CGF.MDVCallLabel = N;
++      // Optimization scheme
++      auto *Sanitizer = CGM.getModule().getOrInsertFunction(
++          strSanitizer, CGM.VoidTy, VTable->getType());
++      if (auto *Func = llvm::dyn_cast<llvm::Function>(Sanitizer)) {
++        Func->setDoesNotThrow();
++        Func->setLinkage(llvm::GlobalValue::ExternalLinkage);
++      }
++      CGF.Builder.CreateCall(Sanitizer, {VTable});
+     }
+ 
+-    llvm::Value *VFuncPtr = nullptr;
+-    VFuncPtr = CGF.Builder.CreateConstInBoundsGEP1_64(VTable, VTableIndex, "vfn");
+-    auto *VFuncLoad = CGF.Builder.CreateAlignedLoad(VFuncPtr, CGF.getPointerAlign());
++    llvm::Value *VFuncPtr =
++        CGF.Builder.CreateConstInBoundsGEP1_64(VTable, VTableIndex, "vfn");
++    auto *VFuncLoad =
++        CGF.Builder.CreateAlignedLoad(VFuncPtr, CGF.getPointerAlign());
+ 
+     // Add !invariant.load md to virtual function load to indicate that
+     // function didn't change inside vtable.
+@@ -1892,8 +1889,10 @@ CGCallee ItaniumCXXABI::getVirtualFunctionPointer(CodeGenFunction &CGF,
+     // happen without enabled devirtualization with -fstrict-vtable-pointers.
+     if (CGM.getCodeGenOpts().OptimizationLevel > 0 &&
+         CGM.getCodeGenOpts().StrictVTablePointers)
+-      VFuncLoad->setMetadata(llvm::LLVMContext::MD_invariant_load,
+-          llvm::MDNode::get(CGM.getLLVMContext(), llvm::ArrayRef<llvm::Metadata *>()));
++      VFuncLoad->setMetadata(
++          llvm::LLVMContext::MD_invariant_load,
++          llvm::MDNode::get(CGM.getLLVMContext(),
++                            llvm::ArrayRef<llvm::Metadata *>()));
+     VFunc = VFuncLoad;
+   }
+ 
+diff --git a/src/integration_test/Makefile b/src/integration_test/Makefile
+index 7e63d27b3..85827c79c 100644
+--- a/src/integration_test/Makefile
++++ b/src/integration_test/Makefile
+@@ -1,8 +1,8 @@
+ ##usage: make [DEBUG=1] [ATLOAD=1]
+ 
+ VLOOM_ROOT	:= ${HOME}/Projects/vloom-vcfi/vloom
+-CC	:= ${VLOOM_ROOT}/llvm-7.1.0.src/build_debug/bin/clang
+-CXX	:= ${VLOOM_ROOT}/llvm-7.1.0.src/build_debug/bin/clang++
++CC	:= ${VLOOM_ROOT}/clang
++CXX	:= ${VLOOM_ROOT}/clang++
+ 
+ 
+ 
+@@ -12,11 +12,11 @@ ifeq (${DEBUG}, 1)
+ 	CXXFLAGS += -O0 -ggdb3 -DDEBUG
+ else
+ 	CXXFLAGS += -O2 -DNDEBUG
+-	export VLOOM_NOP_SIZE=24
++	export VLOOM_SIZE=46
+ endif
+ 
+ ifeq (${ATLOAD}, 1)
+-    CXXFLAGS	+= -Wl,--emit-relocs -Wl,-znotext -Wl,--rpath=${HOME}/Projects/vloom-vcfi/vloom/src/ -L${HOME}/Projects/vloom-vcfi/vloom/src/ -lvloom
++    CXXFLAGS	+= -Wl,--emit-relocs -Wl,-znotext -Wl,--rpath=${VLOOM_ROOT} -L${VLOOM_ROOT} -lvloom
+ else
+     CXXFLAGS    += -Wl,--emit-relocs -Wl,-znotext -Wl,--export-dynamic
+ endif
+diff --git a/src/integration_test/vloom_config.txt b/src/integration_test/vloom_config.txt
+index 731087021..cb58517f3 100644
+--- a/src/integration_test/vloom_config.txt
++++ b/src/integration_test/vloom_config.txt
+@@ -6,7 +6,7 @@ VLOOM_BLOOM32:false
+ VLOOM_FORCE_BLANK:false
+ VLOOM_FORCE_32:false
+ VLOOM_FORCE_COMPRESS:false
+-#VLOOM_TRUNCATE:0        #30
++VLOOM_TRUNCATE:24        #30
+ VLOOM_LOGFILE:stdout #ff.log    #stdout
+ VLOOM_LOGLEVEL:0 #4        #4
+ VLOOM_RTENV_WHLIST:rtenv_white_list.txt
+diff --git a/src/unit_test/Makefile b/src/unit_test/Makefile
+index 946af13fc..ca0cf3586 100644
+--- a/src/unit_test/Makefile
++++ b/src/unit_test/Makefile
+@@ -7,9 +7,6 @@ TARGETS := logging.exe mm.exe config.exe hash.exe  elfmgr.exe cha.exe patch.exe
+ 
+ all: ${TARGETS}
+ 
+-map.exe: test_map.cpp ../utils.cpp
+-	clang++  ${CXXFLAGS}  -o $@ $^ ${LIBS}
+-	${RUNCMD} $@
+ 
+ logging.exe: test_logging.cpp ../logging.cpp ../utils.cpp
+ 	clang++  ${CXXFLAGS}  -o $@ $^ ${LIBS}
+diff --git a/src/vloom_config.txt b/src/vloom_config.txt
+index d83aa6dc6..cb58517f3 100644
+--- a/src/vloom_config.txt
++++ b/src/vloom_config.txt
+@@ -1,13 +1,14 @@
+ #start a comment
++VLOOM_MODE:1
+ VLOOM_K:1               #number of hash function
+-VLOOM_HASH: add32 # crc32_multiply64 #multiply64_crc32 #crc32_multiply64 #add32       #       #add32
++VLOOM_HASH_0: crc32mul64_v2 #add32 # crc32_multiply64 #multiply64_crc32 #crc32_multiply64 #add32       #       #add32
+ VLOOM_BLOOM32:false
+ VLOOM_FORCE_BLANK:false
+ VLOOM_FORCE_32:false
+ VLOOM_FORCE_COMPRESS:false
+-VLOOM_TRUNCATE:0        #30
+-VLOOM_LOGFILE:ff.log    #stdout
+-VLOOM_LOGLEVEL:4        #4
++VLOOM_TRUNCATE:24        #30
++VLOOM_LOGFILE:stdout #ff.log    #stdout
++VLOOM_LOGLEVEL:0 #4        #4
+ VLOOM_RTENV_WHLIST:rtenv_white_list.txt
+ VLOOM_FFIDRV_WHLIST:ffidv_white_list.txt
+ VLOOM_EXTRA_WHLIST:extradrv_white_list.txt
+diff --git a/src/vloomrt.conf b/src/vloomrt.conf
+index 407a79295..a7a5d3cc7 100644
+--- a/src/vloomrt.conf
++++ b/src/vloomrt.conf
+@@ -1,7 +1,7 @@
+ #start a comment
+ VLOOM_MODE:0        #VM_ENFORCE_VCFI = 0; VM_COUNT_VCALL=1
+ VLOOM_K:1           #number of hash function
+-VLOOM_HASH_0: crc32mul64_v2 #add32
++VLOOM_HASH_0: add32 #crc32mul64_v2 #add32
+ VLOOM_HASHTABLE_BITS:24     #16
+ VLOOM_CHECKING_MODE:0       #BFT_COUNTING=0; BFT_MASKING=1
+ VLOOM_COMPRESS_HASHENTRY:true
+@@ -10,7 +10,7 @@ VLOOM_LOW4G_BLOOMF:false
+ VLOOM_AVOID_LEAKING:false
+ VLOOM_RANDSEED_FILE:urandom.rnd
+ VLOOM_LOGFILE:stdout    #ff.log
+-VLOOM_LOGLEVEL:4        #4
++VLOOM_LOGLEVEL:0        #4
+ VLOOM_RTENV_WHLIST:rtenv_white_list.txt
+ VLOOM_FFIDRV_WHLIST:ffidv_white_list.txt
+ VLOOM_EXTRA_WHLIST:extradrv_white_list.txt
