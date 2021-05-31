@@ -392,6 +392,8 @@ void VloomPass::_instrumentVirtualCall(Instruction *I, Function *callee, Value *
   asmStr += ".weak ";
   asmStr += symStr;
   asmStr += "\n";
+  //FIX: encode dollar symbol
+  encode_special_characters(asmStr);
 
   // Pad with NOPs.  This means the binary can be executed without
   // VLOOM instrumentaton; albeit with a performance penalty.
