@@ -381,6 +381,8 @@ void VloomPass::_instrumentVirtualCall(Instruction *I, Function *callee, Value *
 
   std::string strType = strClassName;
   std::string symStr = mysprintf("__VLOOM_VCALL_S%d_R%d", nNopSize, nRegNum);
+  //FIX: encode dollar symbol
+  encode_special_characters(symStr);
 
   // symStr += "_I";
   // symStr += std::to_string(VTableIndex);
@@ -391,9 +393,7 @@ void VloomPass::_instrumentVirtualCall(Instruction *I, Function *callee, Value *
   std::string asmStr;
   asmStr += ".weak ";
   asmStr += symStr;
-  asmStr += "\n";
-  //FIX: encode dollar symbol
-  encode_special_characters(asmStr);
+  asmStr += "\n";  
 
   // Pad with NOPs.  This means the binary can be executed without
   // VLOOM instrumentaton; albeit with a performance penalty.
